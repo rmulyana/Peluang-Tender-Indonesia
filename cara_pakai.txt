@@ -1,0 +1,7 @@
+cd OneDrive/KPMOG/DATA_PIN/PENGUMUMAN_TENDER/Tender-Indonesia
+source tender_venv/bin/activate
+python tender_extract.py
+python tender_simple.py
+python tender_hybrid.py
+
+# Setelah selesai: deactivate
