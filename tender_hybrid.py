@@ -1,485 +1,538 @@
-import pandas as pd
-import re
-from datetime import datetime
-import time
 import os
+import re
+import time
 import threading
+import subprocess
+from datetime import datetime
+from typing import List, Dict, Optional
+
+import pandas as pd
+from bs4 import BeautifulSoup
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.keys import Keys
-import pyperclip
-import subprocess
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-def correct_sector_typos(sector_name):
+
+# =========================
+# Helpers: Normalization
+# =========================
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def correct_sector_typos(sector_name: str) -> str:
     """
-    Correct common typos in sector names
+    Normalize common typos / variations in sector name.
     """
+    if not sector_name:
+        return ""
+    name = sector_name.upper().strip()
+
     corrections = {
-        'ELECTRICTY': 'ELECTRICITY',
-        'GOVERMENT': 'GOVERNMENT',
-        'MANUFACTUR': 'MANUFACTURE',
-        'TELECOMMUNICATON': 'TELECOMMUNICATION',
-        'INFRASTRUCTUR': 'INFRASTRUCTURE',
-        'INTERNATONAL': 'INTERNATIONAL',
-        'CENTRAL GOVERMENT': 'GOVERNMENT',
-        'PROVINCE GOVERMENT': 'GOVERNMENT', 
-        'CITY GOVERMENT': 'GOVERNMENT',
-        'REGENCY GOVERMENT': 'GOVERNMENT',
-        'ALL GOVERMENT': 'GOVERNMENT'
+        "ELECTRICTY": "ELECTRICITY",
+        "ELECTRIC": "ELECTRICITY",
+        "ELECTRICITY": "ELECTRICITY",
+        "GOVERMENT": "GOVERNMENT",
+        "GOVERNMENT": "GOVERNMENT",
+        "MANUFACTUR": "MANUFACTURE",
+        "MANUFACTURE": "MANUFACTURE",
+        "TELECOMMUNICATON": "TELECOMMUNICATION",
+        "TELECOMMUNICATION": "TELECOMMUNICATION",
+        "INFRASTRUCTUR": "INFRASTRUCTURE",
+        "INFRASTRUCTURE": "INFRASTRUCTURE",
+        "INTERNATONAL": "INTERNATIONAL",
+        "INTERNATIONAL": "INTERNATIONAL",
+        "MINING / CEMENT": "MINING / CEMENT",
+        "PLANTATION": "PLANTATION",
+        "BANK AND FINANCIAL SERVICE": "BANK AND FINANCIAL SERVICE",
+        "HOSPITAL": "HOSPITAL",
+        "OTHER PRIVATE SECTOR": "OTHER PRIVATE SECTOR",
+        "OIL & GAS": "OIL & GAS",
     }
-    
-    if sector_name in corrections:
-        return corrections[sector_name]
-    
-    return sector_name
 
-def detect_sector_from_client(client_name):
+    if name in corrections:
+        return corrections[name]
+
+    # partial match fallback
+    for wrong, fixed in corrections.items():
+        if wrong in name:
+            return fixed
+
+    return name
+
+
+def detect_sector_from_client(client_name: str) -> str:
     """
-    Detect sector based on client name
+    Fallback detection of sector based on client keywords.
     """
-    if not client_name or client_name == "Unknown Client":
-        return "OTHER PRIVATE SECTOR"
-        
-    client_upper = client_name.upper()
-    
+    if not client_name:
+        return ""
+
+    name = client_name.upper()
+
     # Oil & Gas
-    if any(keyword in client_upper for keyword in ['PERTAMINA', 'PETROCHINA', 'SHELL', 'EXXON', 'CHEVRON']):
+    if any(k in name for k in ["PERTAMINA", "PETROCHINA", "MEDCO", "CHEVRON", "SHELL", "MUBADALA", "BP "]):
         return "OIL & GAS"
-    
-    # Government
-    if any(keyword in client_upper for keyword in ['KEMENTERIAN', 'BADAN', 'PROVINSI', 'KOTA', 'KABUPATEN', 'BUPATI', 'WALIKOTA', 'GUBERNUR']):
-        return "GOVERNMENT"
-    
-    # Electricity/Energy
-    if any(keyword in client_upper for keyword in ['PLN', 'ELECTRIC', 'ENERGI', 'POWER', 'LISTRIK', 'DONGFANG']):
+
+    # Power / Electricity
+    if any(k in name for k in ["PLN", "ELECTRIC", "POWER", "TENAGA LISTRIK"]):
         return "ELECTRICITY"
-    
-    # Mining
-    if any(keyword in client_upper for keyword in ['MINING', 'TAMBANG', 'COAL', 'BATUBARA']):
-        return "MINING / CEMENT"
-    
-    # Bank/Financial
-    if any(keyword in client_upper for keyword in ['BANK', 'FINANCE', 'ASURANSI']):
+
+    # Government
+    if any(k in name for k in ["KEMENTERIAN", "PEMERINTAH", "PEMKAB", "PEMKOT", "PEMPROV", "DINAS", "KABUPATEN", "KOTA"]):
+        return "GOVERNMENT"
+
+    # Banking & Finance
+    if any(k in name for k in ["BANK ", "BPR ", "FINANCE", "ASURANSI"]):
         return "BANK AND FINANCIAL SERVICE"
-    
-    return "OTHER PRIVATE SECTOR"
 
-def parse_tender_data_smart(text_content):
-    """
-    Smart parsing function untuk text yang di-copy paste
-    """
-    print("🔄 SMART PARSING STARTED...")
-    
-    lines = text_content.split('\n')
-    tenders = []
-    
-    current_sector = ""
-    current_client = ""
-    
-    print(f"📊 Total lines to process: {len(lines)}")
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        
-        if not line or len(line) < 2:
-            i += 1
-            continue
-        
-        # 1. Detect sector headers
-        sector_headers = [
-            'OIL & GAS', 'ELECTRICTY', 'ELECTRICITY', 'INFRASTRUCTURE',
-            'MINING / CEMENT', 'PLANTATION', 'BANK AND FINANCIAL SERVICE',
-            'MANUFACTURE', 'TELECOMMUNICATION', 'HOSPITAL', 'INTERNATIONAL',
-            'OTHER PRIVATE SECTOR', 'GOVERNMENT', 'CENTRAL GOVERMENT',
-            'PROVINCE GOVERMENT', 'CITY GOVERMENT', 'REGENCY GOVERMENT', 'ALL GOVERMENT'
-        ]
-        
-        for sector in sector_headers:
-            if sector in line.upper() and len(line) < 100:
-                corrected_sector = correct_sector_typos(sector.upper())
-                if current_sector != corrected_sector:
-                    current_sector = corrected_sector
-                    current_client = ""
-                    print(f"✅ SECTOR: {current_sector}")
-                break
-        
-        # 2. Detect client (simple logic)
-        is_potential_client = (
-            len(line) > 3 and 
-            len(line) < 100 and
-            not '(2025-' in line and
-            not any(sector in line.upper() for sector in sector_headers) and
-            not line.startswith('o') and
-            not line.startswith('•') and
-            not line.startswith(')') and
-            not 'DALAM PROSES ENTRI DATA' in line.upper() and
-            any(pattern in line.upper() for pattern in [
-                'PT ', 'CV ', 'KEMENTERIAN', 'BADAN', 'PROVINSI', 'KOTA', 
-                'KABUPATEN', 'PERTAMINA', 'PETROCHINA', 'DONGFANG'
-            ])
-        )
-        
-        if is_potential_client:
-            client_name = line.split('(')[0].split('-')[0].strip()
-            
-            if len(client_name) > 3:
-                current_client = client_name
-                if not current_sector:
-                    current_sector = detect_sector_from_client(current_client)
-                print(f"✅ CLIENT: {current_client} -> {current_sector}")
-        
-        # 3. TENDER PARSING - Simple pattern matching
-        if '(2025-' in line:
-            # Pattern untuk: o (2025-11-10) (SOW) Judul
-            patterns = [
-                r'[o•]\s+\((\d{4}-\d{2}-\d{2})\)\s+\(([^)]+)\)\s+(.+)',
-                r'\((\d{4}-\d{2}-\d{2})\)\s+\(([^)]+)\)\s+(.+)',
-                r'[o•]\s+\((\d{4}-\d{2}-\d{2})\)\s+\(([^)]+)\)\s+\)\s*(.+)',
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, line)
-                if match:
-                    date = match.group(1)
-                    sow = match.group(2).strip()
-                    title = match.group(3).strip()
-                    
-                    # Clean title
-                    title = re.sub(r'^\)\s*', '', title)
-                    
-                    # Jika tidak ada client, cari dari line sebelumnya
-                    if not current_client and i > 0:
-                        for j in range(i-1, max(0, i-3), -1):
-                            prev_line = lines[j].strip()
-                            if (prev_line and 
-                                not '(2025-' in prev_line and
-                                len(prev_line) > 3 and len(prev_line) < 100):
-                                potential_client = prev_line.split('(')[0].split('-')[0].strip()
-                                if len(potential_client) > 3:
-                                    current_client = potential_client
-                                    if not current_sector:
-                                        current_sector = detect_sector_from_client(current_client)
-                                    break
-                    
-                    # Final fallback
-                    if not current_client:
-                        current_client = "Unknown Client"
-                    if not current_sector:
-                        current_sector = "OTHER PRIVATE SECTOR"
-                    
-                    # Validasi dan simpan
-                    if (title and len(title) > 5 and 
-                        re.match(r'\d{4}-\d{2}-\d{2}', date) and
-                        len(sow) > 2):
-                        
-                        tender_data = {
-                            'Sector': current_sector,
-                            'Client': current_client,
-                            'Tanggal Rilis': date,
-                            'SOW': sow,
-                            'Judul Tender': title
-                        }
-                        
-                        # Cek duplikat
-                        is_duplicate = False
-                        for existing in tenders:
-                            if (existing['Judul Tender'] == title and 
-                                existing['Client'] == current_client):
-                                is_duplicate = True
-                                break
-                        
-                        if not is_duplicate:
-                            tenders.append(tender_data)
-                            print(f"✅ TENDER: {current_client} | {date} | {sow} | {title[:60]}...")
-                    
-                    break
-        
-        i += 1
-    
-    print(f"🎯 TOTAL TENDERS PARSED: {len(tenders)}")
-    return tenders
+    # Hospital
+    if any(k in name for k in ["RS ", "RUMAH SAKIT", "HOSPITAL", "CLINIC", "KLINIK"]):
+        return "HOSPITAL"
 
-def manual_input_mode():
-    """
-    Mode input manual tradisional
-    """
-    print("📝 MANUAL INPUT MODE")
-    print("=" * 50)
-    print("Silakan paste data tender (tekan Ctrl+D setelah selesai):")
-    
-    lines = []
-    try:
-        while True:
-            line = input()
-            lines.append(line)
-    except EOFError:
-        pass
-    
-    text_content = "\n".join(lines)
-    return parse_tender_data_smart(text_content)
+    # Plantation / Agro
+    if any(k in name for k in ["PLANTATION", "SAWIT", "PALM", "PERKEBUNAN"]):
+        return "PLANTATION"
 
-def find_brave_browser():
+    return ""
+
+
+# =========================
+# Helpers: Date Parsing
+# =========================
+
+MONTH_MAP_ID = {
+    "JAN": 1, "JANUARI": 1,
+    "FEB": 2, "FEBRUARI": 2,
+    "MAR": 3, "MARET": 3,
+    "APR": 4, "APRIL": 4,
+    "MEI": 5,
+    "JUN": 6, "JUNI": 6,
+    "JUL": 7, "JULI": 7,
+    "AGU": 8, "AGS": 8, "AGUSTUS": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OKT": 10, "OKTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DES": 12, "DESEMBER": 12,
+}
+
+
+def parse_date(text: str) -> Optional[datetime]:
     """
-    Cari lokasi Brave Browser di Mac
+    Deteksi tanggal dari satu baris teks dalam berbagai format umum.
     """
-    possible_paths = [
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        "/Applications/Brave Browser Nightly.app/Contents/MacOS/Brave Browser",
-        os.path.expanduser("~/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-    ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            print(f"✅ Brave ditemukan: {path}")
-            return path
-    
-    try:
-        result = subprocess.run(["which", "brave-browser"], capture_output=True, text=True)
-        if result.returncode == 0:
-            brave_path = result.stdout.strip()
-            print(f"✅ Brave ditemukan via command: {brave_path}")
-            return brave_path
-    except:
-        pass
-    
-    print("❌ Brave Browser tidak ditemukan, menggunakan Chrome default")
+    if not text:
+        return None
+    t = text.strip()
+
+    # dd/mm/yy atau dd/mm/yyyy
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", t)
+    if m:
+        d, mo, y = m.groups()
+        d = int(d)
+        mo = int(mo)
+        y = int(y)
+        if y < 100:
+            y += 2000
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            return None
+
+    # dd Mon yyyy (ID)
+    m = re.search(r"(\d{1,2})\s+([A-Za-z\.]+)\s*(\d{4})?", t)
+    if m:
+        d = int(m.group(1))
+        mon_raw = m.group(2).replace(".", "").upper()
+        y = m.group(3)
+        mo = MONTH_MAP_ID.get(mon_raw)
+        if mo:
+            if y:
+                year = int(y)
+            else:
+                year = datetime.now().year
+            try:
+                return datetime(year, mo, d)
+            except ValueError:
+                return None
+
     return None
 
-def setup_brave_driver():
-    """
-    Setup Brave browser driver
-    """
-    print("🦁 Setting up Brave browser...")
-    
-    try:
-        brave_path = find_brave_browser()
-        
-        chrome_options = Options()
-        
-        if brave_path:
-            chrome_options.binary_location = brave_path
-            print("✅ Using Brave Browser")
-        else:
-            print("⚠️  Using default Chrome")
-        
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.add_argument("--user-data-dir=./brave_session")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--start-maximized")
-        chrome_options.add_argument("--remote-allow-origins=*")
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        print("✅ Browser driver ready")
-        return driver
-        
-    except Exception as e:
-        print(f"❌ Browser driver setup failed: {e}")
-        return None
 
-def copy_page_content(driver):
-    """
-    Smart copy content dari halaman web dengan Select All + Copy
-    """
-    print("📋 COPYING PAGE CONTENT...")
-    
-    try:
-        # Method 1: Try to select all using body element
-        body = driver.find_element(By.TAG_NAME, "body")
-        
-        # Clear any existing selection
-        body.click()
-        
-        # Select all (Cmd+A on Mac, Ctrl+A on Windows/Linux)
-        actions = ActionChains(driver)
-        actions.key_down(Keys.COMMAND if os.name == 'posix' else Keys.CONTROL)
-        actions.send_keys('a')
-        actions.key_up(Keys.COMMAND if os.name == 'posix' else Keys.CONTROL)
-        actions.perform()
-        
-        time.sleep(1)
-        
-        # Copy selection (Cmd+C on Mac, Ctrl+C on Windows/Linux)
-        actions = ActionChains(driver)
-        actions.key_down(Keys.COMMAND if os.name == 'posix' else Keys.CONTROL)
-        actions.send_keys('c')
-        actions.key_up(Keys.COMMAND if os.name == 'posix' else Keys.CONTROL)
-        actions.perform()
-        
-        time.sleep(1)
-        
-        # Get content from clipboard
-        copied_content = pyperclip.paste()
-        
-        if copied_content and len(copied_content) > 100:
-            print(f"✅ Successfully copied {len(copied_content)} characters")
-            return copied_content
-        else:
-            print("❌ Clipboard content too short, trying alternative method...")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Copy method failed: {e}")
-        return None
+def format_date(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    return dt.strftime("%Y-%m-%d")
 
-class BraveSessionManager:
+
+# =========================
+# Parsing Tender Text
+# =========================
+
+SECTOR_HEADERS = [
+    "OIL & GAS",
+    "ELECTRICTY",
+    "ELECTRICITY",
+    "INFRASTRUCTURE",
+    "MINING / CEMENT",
+    "PLANTATION",
+    "BANK AND FINANCIAL SERVICE",
+    "MANUFACTURE",
+    "TELECOMMUNICATION",
+    "HOSPITAL",
+    "INTERNATIONAL",
+    "OTHER PRIVATE SECTOR",
+    "GOVERNMENT",
+]
+
+
+def looks_like_sector_header(line: str) -> bool:
+    line_up = clean_text(line).upper()
+    if not line_up:
+        return False
+    if len(line_up) > 80:
+        return False
+    return any(line_up == sh or sh in line_up for sh in SECTOR_HEADERS)
+
+
+def looks_like_client_header(line: str) -> bool:
+    """
+    Heuristik: baris client biasanya:
+    - panjang sedang
+    - ada PT / CV / Kementerian / Pemda / dll
+    - muncul setelah header sector.
+    """
+    line_up = clean_text(line).upper()
+    if not line_up:
+        return False
+    if len(line_up) > 120:
+        return False
+
+    if any(k in line_up for k in [
+        "PT ", "PT.", "CV ", "CV.",
+        "KEMENTERIAN", "PEMERINTAH", "PEMKAB", "PEMKOT",
+        "DINAS", "UNIVERSITAS", "POLITEKNIK",
+        "RUMAH SAKIT", "RS ", "RSU ", "RSUD "
+    ]):
+        return True
+
+    return False
+
+
+def extract_tender_items_from_lines(lines: List[str]) -> List[Dict]:
+    tenders: List[Dict] = []
+
+    current_sector = ""
+    current_client = ""
+    buffer_lines: List[str] = []
+
+    def flush_buffer():
+        nonlocal buffer_lines
+        if not buffer_lines:
+            return
+
+        full = clean_text(" ".join(buffer_lines))
+        buffer_lines = []
+        if not full:
+            return
+
+        # tanggal
+        dt = parse_date(full)
+        tanggal = format_date(dt)
+
+        # default: (SOW) Judul Tender
+        sow = ""
+        title = full
+
+        # pola: (EPC) Judul...
+        m = re.match(r"^\(([^)]+)\)\s*(.+)", full)
+        if m:
+            sow = clean_text(m.group(1))
+            title = clean_text(m.group(2))
+        else:
+            # pola: SOW: ...   Judul...
+            m2 = re.match(r"^SOW\s*[:\-]\s*(.+?)\s{2,}(.+)$", full, flags=re.IGNORECASE)
+            if m2:
+                sow = clean_text(m2.group(1))
+                title = clean_text(m2.group(2))
+
+        # fallback: asumsi 4 kata pertama ~ SOW
+        if not sow:
+            tokens = title.split()
+            if len(tokens) > 4:
+                sow = " ".join(tokens[:4])
+                title = " ".join(tokens[4:])
+
+        sow = clean_text(sow)
+        title = clean_text(title)
+
+        if not title:
+            return
+
+        sector_final = correct_sector_typos(current_sector) if current_sector else ""
+        if not sector_final and current_client:
+            sector_final = detect_sector_from_client(current_client)
+
+        tenders.append({
+            "Sector": sector_final,
+            "Client": clean_text(current_client),
+            "Tanggal Rilis": tanggal,
+            "SOW": sow,
+            "Judul Tender": title,
+        })
+
+    for raw in lines:
+        line = clean_text(raw)
+        if not line:
+            continue
+
+        # header sector
+        if looks_like_sector_header(line):
+            flush_buffer()
+            current_sector = correct_sector_typos(line)
+            current_client = ""
+            continue
+
+        # client
+        if looks_like_client_header(line):
+            flush_buffer()
+            current_client = line
+            continue
+
+        # bullet / nomor -> item baru
+        if re.match(r"^[•\-\u2022\u2023\u25E6\d]+[)\.\-\s]", raw.strip()):
+            flush_buffer()
+            buffer_lines = [line]
+            flush_buffer()
+            continue
+
+        # akumulasi
+        buffer_lines.append(line)
+
+    flush_buffer()
+    return tenders
+
+
+# =========================
+# HTML Extraction
+# =========================
+
+def extract_text_lines_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    texts: List[str] = []
+
+    # ambil teks dari elemen-elemen umum
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "b", "strong", "p", "td", "li", "span"]):
+        t = clean_text(tag.get_text(separator=" "))
+        if t:
+            texts.append(t)
+
+    if not texts:
+        all_text = clean_text(soup.get_text(separator="\n"))
+        texts = [ln for ln in all_text.split("\n") if clean_text(ln)]
+
+    return texts
+
+
+# =========================
+# Selenium Session Manager
+# =========================
+
+class SessionManager:
     def __init__(self):
-        self.driver = None
-        
-    def get_authenticated_session(self):
-        """
-        Dapatkan session yang terautentikasi
-        """
-        print("🦁 BRAVE BROWSER SESSION MANAGER")
-        print("=" * 50)
-        print("Pilih metode:")
-        print("1. Smart Copy Mode (Select All + Copy dari browser)")
-        print("2. Manual input saja")
-        
-        choice = input("Pilihan (1/2): ").strip()
-        
-        if choice == "2":
-            print("📝 Switching to manual input mode...")
-            return None, None
-        else:
-            return self.smart_copy_mode()
-    
-    def smart_copy_mode(self):
-        """Mode Smart Copy dengan Select All + Copy"""
-        print("🎯 SMART COPY MODE")
-        print("-" * 45)
-        print("Panduan:")
-        print("1. Browser akan buka halaman tender")
-        print("2. Login manual jika diperlukan") 
-        print("3. Scroll ke bagian yang ingin di-copy")
-        print("4. Kembali ke terminal dan tekan Enter")
-        print("5. Program akan otomatis Select All + Copy")
-        print("-" * 45)
-        
-        self.driver = setup_brave_driver()
-        if not self.driver:
-            print("❌ Failed to start browser, falling back to manual mode")
-            return None, None
-        
-        try:
-            # Buka halaman tender
-            self.driver.get("https://tender-indonesia.com/Project_room/Index_info.php")
-            print("✅ Browser opened to: https://tender-indonesia.com/Project_room/Index_info.php")
-            print("💡 Silakan login dan scroll ke data yang ingin di-copy...")
-            input("Press Enter ketika siap untuk copy content...")
-            
-            # Copy content dari halaman
-            copied_content = copy_page_content(self.driver)
-            
-            if copied_content:
-                print("📋 CONTENT COPIED SUCCESSFULLY!")
-                print("🔄 Now parsing the copied content...")
-                
-                # Tampilkan preview content yang di-copy
-                print(f"\n📄 COPIED CONTENT PREVIEW (first 500 chars):")
-                print("-" * 50)
-                print(copied_content[:500] + "..." if len(copied_content) > 500 else copied_content)
-                print("-" * 50)
-                
-                # Parse content yang sudah di-copy
-                tenders = parse_tender_data_smart(copied_content)
-                return tenders, copied_content
-            else:
-                print("❌ Failed to copy content, using manual mode")
-                return None, None
-                
-        except Exception as e:
-            print(f"❌ Smart copy mode failed: {e}")
-            return None, None
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        if self.driver:
+        self._driver: Optional[webdriver.Chrome] = None
+        self._lock = threading.Lock()
+
+    def _create_driver(self) -> webdriver.Chrome:
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--window-size=1920,1080")
+
+        driver_path = os.getenv("CHROMEDRIVER_PATH")
+        if not driver_path:
             try:
-                self.driver.quit()
-                print("✅ Browser closed")
-            except:
-                pass
+                result = subprocess.run(["which", "chromedriver"], capture_output=True, text=True)
+                path = result.stdout.strip()
+                if path:
+                    driver_path = path
+            except Exception:
+                driver_path = None
+
+        if driver_path:
+            driver = webdriver.Chrome(driver_path, options=chrome_options)
+        else:
+            driver = webdriver.Chrome(options=chrome_options)
+
+        return driver
+
+    def get_driver(self) -> webdriver.Chrome:
+        with self._lock:
+            if self._driver is None:
+                self._driver = self._create_driver()
+            return self._driver
+
+    def cleanup(self):
+        with self._lock:
+            if self._driver is not None:
+                try:
+                    self._driver.quit()
+                except Exception:
+                    pass
+                self._driver = None
+
+
+# =========================
+# Web Scraping Logic
+# =========================
+
+def scrape_page_with_selenium(session: SessionManager, url: str, wait_selector: Optional[str] = None) -> str:
+    driver = session.get_driver()
+    driver.get(url)
+
+    if wait_selector:
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector))
+            )
+        except Exception:
+            pass
+
+    time.sleep(2)
+    return driver.page_source
+
+
+# =========================
+# I/O helpers
+# =========================
+
+def find_candidate_files() -> List[str]:
+    exts = (".html", ".htm", ".txt")
+    files = [f for f in os.listdir(".") if f.lower().endswith(exts)]
+    return sorted(files)
+
+
+def choose_file_interactively() -> Optional[str]:
+    files = find_candidate_files()
+    if not files:
+        print("Tidak ada file .html/.htm/.txt di folder ini.")
+        return None
+
+    print("\nPilih file sumber:")
+    for i, f in enumerate(files, 1):
+        print(f"{i}. {f}")
+
+    while True:
+        idx = input("Masukkan nomor file (atau kosong untuk batal): ").strip()
+        if not idx:
+            return None
+        if idx.isdigit() and 1 <= int(idx) <= len(files):
+            return files[int(idx) - 1]
+        print("Input tidak valid.")
+
+
+def export_to_excel(tenders: List[Dict], output_name: str = "tender_parsed.xlsx") -> str:
+    if not tenders:
+        print("Tidak ada data untuk diekspor.")
+        return ""
+
+    df = pd.DataFrame(tenders)
+
+    if "Tanggal Rilis" in df.columns:
+        df["Tanggal Rilis Sort"] = pd.to_datetime(df["Tanggal Rilis"], errors="coerce")
+        df = df.sort_values("Tanggal Rilis Sort", ascending=False).drop(columns=["Tanggal Rilis Sort"])
+
+    df.index = range(1, len(df) + 1)
+    df.to_excel(output_name, index_label="No")
+    print(f"OK. File disimpan sebagai: {output_name}")
+    return output_name
+
+
+# =========================
+# Main Flow
+# =========================
+
+def parse_from_local_file() -> List[Dict]:
+    filename = choose_file_interactively()
+    if not filename:
+        return []
+
+    with open(filename, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if filename.lower().endswith((".html", ".htm")):
+        lines = extract_text_lines_from_html(content)
+    else:
+        content = content.replace("\r", "\n")
+        lines = [ln for ln in content.split("\n") if clean_text(ln)]
+
+    print(f"Loaded {len(lines)} lines from {filename}")
+    tenders = extract_tender_items_from_lines(lines)
+    return tenders
+
+
+def parse_from_web(session: SessionManager) -> List[Dict]:
+    url = input("Masukkan URL halaman tender: ").strip()
+    if not url:
+        return []
+
+    print(f"Load {url} ...")
+    html = scrape_page_with_selenium(session, url)
+
+    lines = extract_text_lines_from_html(html)
+    print(f"HTML parsed menjadi {len(lines)} baris teks.")
+    tenders = extract_tender_items_from_lines(lines)
+    return tenders
+
 
 def main():
-    """
-    Main function dengan Smart Copy Mode
-    """
-    print("🚀 SMART TENDER EXTRACTOR - COPY/PASTE METHOD")
-    print("=" * 60)
-    
-    session_manager = BraveSessionManager()
-    all_tenders = []
-    
+    print("=== Tender Parser Hybrid ===")
+    print("1. Parse dari file lokal (.html/.txt)")
+    print("2. Parse dari halaman web (Selenium)")
+    print("3. Keluar")
+
+    session = SessionManager()
+
     try:
-        result, copied_content = session_manager.get_authenticated_session()
-        
-        if result is not None:
-            # Smart copy mode mengembalikan list of tenders
-            all_tenders = result
-            print(f"✅ Smart copy berhasil! Ditemukan {len(all_tenders)} tender")
-            
-            # Tanya user apakah ingin menyimpan content yang di-copy
-            if copied_content and len(all_tenders) == 0:
-                print("\n⚠️  Tidak ada tender yang terdeteksi dalam content yang di-copy!")
-                save_choice = input("Apakah ingin menyimpan content yang di-copy ke file untuk debugging? (y/n): ").strip().lower()
-                if save_choice == 'y':
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    debug_file = f'debug_copied_content_{timestamp}.txt'
-                    with open(debug_file, 'w', encoding='utf-8') as f:
-                        f.write(copied_content)
-                    print(f"💾 Debug content saved to: {debug_file}")
+        choice = input("Pilih mode [1/2/3]: ").strip()
+
+        if choice == "1":
+            tenders = parse_from_local_file()
+        elif choice == "2":
+            tenders = parse_from_web(session)
         else:
-            print("\n📝 MANUAL MODE")
-            all_tenders = manual_input_mode()
-        
-        # Process and save data
-        if all_tenders:
-            df = pd.DataFrame(all_tenders)
-            df = df[['Sector', 'Client', 'Tanggal Rilis', 'SOW', 'Judul Tender']]
-            df = df.drop_duplicates()
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = f'tender_data_{timestamp}.xlsx'
-            df.to_excel(output_file, index=False, engine='openpyxl')
-            
-            print(f"\n💾 Data disimpan: {output_file}")
-            print(f"📊 Total tender: {len(df)}")
-            
-            # Show sector distribution
-            sector_stats = df['Sector'].value_counts()
-            print(f"\n📂 DISTRIBUSI SECTOR:")
-            for sector, count in sector_stats.items():
-                print(f"   • {sector}: {count} tender")
-            
-            # Show sample
-            print("\n📋 SAMPLE DATA:")
-            for i, row in df.head(5).iterrows():
-                print(f"{i+1}. {row['Sector']} | {row['Client']} | {row['Tanggal Rilis']}")
-                print(f"   SOW: {row['SOW']}")
-                print(f"   Judul: {row['Judul Tender'][:80]}...")
-                print()
-                
-        else:
-            print("❌ Tidak ada data tender yang ditemukan")
-        
+            return
+
+        if not tenders:
+            print("❌ Tidak ada tender yang berhasil diparsing.")
+            return
+
+        print(f"✅ Total tender terbaca: {len(tenders)}")
+
+        sample = min(5, len(tenders))
+        print("\nSample data:")
+        for i in range(sample):
+            row = tenders[i]
+            print(f"{i+1}. {row.get('Sector','')} | {row.get('Client','')} | {row.get('Tanggal Rilis','')}")
+            print(f"   SOW  : {row.get('SOW','')}")
+            print(f"   Judul: {row.get('Judul Tender','')[:100]}...")
+            print()
+
+        export_to_excel(tenders)
+
     finally:
-        session_manager.cleanup()
+        session.cleanup()
+
 
 if __name__ == "__main__":
-    # Install pyperclip jika belum ada
-    try:
-        import pyperclip
-    except ImportError:
-        print("📦 Installing pyperclip...")
-        subprocess.check_call(["pip", "install", "pyperclip"])
-        import pyperclip
-    
     main()
